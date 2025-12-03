@@ -1,0 +1,837 @@
+# main_complete_v2.py
+# UNIP - Sistema Acadêmico Colaborativo (updated fixes requested by user)
+# Changes from previous:
+# - Professor view now shows student NOME (and email in column) instead of only email.
+# - Clicking on a student presents only two options: "lançar notas" and "lançar faltas" and directs to the correct tab.
+# - Cronogramas now contain 5 modules per discipline; each module has a title and subtopics. When checked, the date is stored in DD/MM/YYYY.
+# - Student dashboard shows only the four UNIVERSAL_DISCIPLINES.
+# - Keeps previous fixes: login fields visible, centered registration layout, seed data.
+#
+# Run: python main_complete_v2.py
+
+import tkinter as tk
+from tkinter import ttk, messagebox, simpledialog
+import sqlite3, os, datetime, re, threading
+
+DB_FILE = "sistema_academico.db"
+
+MAIN_BG = "#001f3f"
+INNER_BG = "#cfeeff"
+UNIP_YELLOW = "#FFD700"
+BTN_BG = "#00509e"
+BTN_FG = "#FFFFFF"
+FONT_LABEL = ("Arial", 10, "bold")
+
+UNIVERSAL_DISCIPLINES = [
+    "Engenharia de Software Ágil",
+    "Algoritmo e Estrutura de Dados em Python",
+    "Programação Estruturada em C",
+    "Analise e Projeto de Sistemas"
+]
+
+INITIAL_STUDENTS = [
+    ("David Willian", "A123456"),
+    ("Guilherme Mendonça", "B123456"),
+    ("Walisson Pereira", "C123456"),
+    ("Thomas Lopes", "D123456"),
+    ("Vinicius Hisashi", "E123456"),
+]
+
+INITIAL_PROFESSORS = [
+    ("Airton", "Engenharia de Software Ágil"),
+    ("Ageu", "Algoritmo e Estrutura de Dados em Python"),
+    ("Ivan", "Programação Estruturada em C"),
+    ("Glauco", "Analise e Projeto de Sistemas"),
+]
+
+COORD_EMAIL = "coordenadorads@unip.edu.br"
+COORD_PASS = "1234567"
+
+SEMESTER_TOTAL_CLASSES = 80
+MAX_ALLOWED_ABSENCES = 15
+
+class DBWatcher:
+    def __init__(self):
+        self._v = 0
+        self._lock = threading.Lock()
+    def bump(self):
+        with self._lock:
+            self._v += 1
+    def value(self):
+        with self._lock:
+            return self._v
+
+db_watcher = DBWatcher()
+
+def connect_db():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    created = not os.path.exists(DB_FILE)
+    conn = connect_db(); c = conn.cursor()
+    c.executescript("""
+    CREATE TABLE IF NOT EXISTS alunos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        nome TEXT NOT NULL,
+        data_nasc TEXT,
+        ra TEXT UNIQUE NOT NULL,
+        senha TEXT NOT NULL,
+        email TEXT UNIQUE
+    );
+    CREATE TABLE IF NOT EXISTS professores (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        nome TEXT NOT NULL,
+        email TEXT UNIQUE NOT NULL,
+        senha TEXT NOT NULL,
+        disciplina TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS disciplinas (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        nome TEXT UNIQUE NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS matriculas (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        aluno_id INTEGER NOT NULL,
+        disciplina_id INTEGER NOT NULL,
+        UNIQUE(aluno_id, disciplina_id)
+    );
+    CREATE TABLE IF NOT EXISTS notas (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        aluno_id INTEGER NOT NULL,
+        disciplina_id INTEGER NOT NULL,
+        np1 REAL,
+        np2 REAL,
+        UNIQUE(aluno_id, disciplina_id)
+    );
+    CREATE TABLE IF NOT EXISTS frequencia (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        aluno_id INTEGER NOT NULL,
+        disciplina_id INTEGER NOT NULL,
+        presencas INTEGER DEFAULT 0,
+        faltas INTEGER DEFAULT 0,
+        UNIQUE(aluno_id, disciplina_id)
+    );
+    CREATE TABLE IF NOT EXISTS cronogramas (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        disciplina_id INTEGER NOT NULL,
+        modulo_index INTEGER NOT NULL,
+        titulo TEXT,
+        subtemas TEXT,
+        marcado INTEGER DEFAULT 0,
+        marcado_em TEXT
+    );
+    CREATE TABLE IF NOT EXISTS chat (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        remetente_type TEXT,
+        remetente_email TEXT,
+        destinatario_type TEXT,
+        destinatario_email TEXT,
+        mensagem TEXT,
+        data TEXT
+    );
+    CREATE TABLE IF NOT EXISTS usuarios (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        usuario TEXT UNIQUE,
+        senha TEXT,
+        tipo TEXT
+    );
+    CREATE TABLE IF NOT EXISTS motivos_exclusao (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chave TEXT UNIQUE,
+        descricao TEXT
+    );
+    """)
+    # motivos defaults and disciplines
+    c.execute("INSERT OR IGNORE INTO motivos_exclusao (chave, descricao) VALUES (?, ?)", ("transferencia", "Aluno transferido de campus"))
+    c.execute("INSERT OR IGNORE INTO motivos_exclusao (chave, descricao) VALUES (?, ?)", ("trancamento", "Aluno trancou o curso"))
+    c.execute("INSERT OR IGNORE INTO motivos_exclusao (chave, descricao) VALUES (?, ?)", ("pendencia_financeira", "Aluno em débito com o financeiro há mais de 6 meses"))
+    for d in UNIVERSAL_DISCIPLINES:
+        c.execute("INSERT OR IGNORE INTO disciplinas (nome) VALUES (?)", (d,))
+    # ensure coordinator user
+    c.execute("INSERT OR IGNORE INTO usuarios (usuario, senha, tipo) VALUES (?, ?, ?)", (COORD_EMAIL, COORD_PASS, "coordenador"))
+    conn.commit(); conn.close()
+    return created
+
+def seed_initial_data():
+    conn = connect_db(); c = conn.cursor()
+    # students
+    for nome, ra in INITIAL_STUDENTS:
+        email = f"{nome.split()[0].lower()}@unip.edu.br"
+        c.execute("SELECT id FROM alunos WHERE ra=?", (ra,))
+        if not c.fetchone():
+            c.execute("INSERT INTO alunos (nome, data_nasc, ra, senha, email) VALUES (?, ?, ?, ?, ?)", (nome, "10/07/2000", ra, "12345", email))
+            aid = c.lastrowid
+            c.execute("INSERT OR IGNORE INTO usuarios (usuario, senha, tipo) VALUES (?, ?, ?)", (email, "12345", "aluno"))
+            # matriculate in the 4 universal disciplines only
+            for dname in UNIVERSAL_DISCIPLINES:
+                c.execute("SELECT id FROM disciplinas WHERE nome=?", (dname,))
+                dr = c.fetchone()
+                if dr:
+                    did = dr["id"]
+                    c.execute("INSERT OR IGNORE INTO matriculas (aluno_id, disciplina_id) VALUES (?, ?)", (aid, did))
+                    c.execute("INSERT OR IGNORE INTO notas (aluno_id, disciplina_id, np1, np2) VALUES (?, ?, ?, ?)", (aid, did, None, None))
+                    c.execute("INSERT OR IGNORE INTO frequencia (aluno_id, disciplina_id, presencas, faltas) VALUES (?, ?, ?, ?)", (aid, did, 0, 0))
+    # professors
+    for nome, materia in INITIAL_PROFESSORS:
+        email = f"{nome.split()[0].lower()}@unip.edu.br"
+        c.execute("SELECT id FROM professores WHERE email=?", (email,))
+        if not c.fetchone():
+            # ensure discipline exists
+            c.execute("INSERT OR IGNORE INTO professores (nome, email, senha, disciplina) VALUES (?, ?, ?, ?)", (nome, email, "12345", materia))
+            c.execute("INSERT OR IGNORE INTO usuarios (usuario, senha, tipo) VALUES (?, ?, ?)", (email, "12345", "professor"))
+            # create 5 modules for this discipline if not existing
+            c.execute("SELECT id FROM disciplinas WHERE nome=?", (materia,))
+            dr = c.fetchone()
+            if dr:
+                did = dr["id"]
+                c.execute("SELECT COUNT(*) as cnt FROM cronogramas WHERE disciplina_id=?", (did,))
+                if c.fetchone()["cnt"] == 0:
+                    # create modules with subtopics (5 modules)
+                    modules = [
+                        ("Introdução e conceitos gerais", "Conceitos;História;Aplicações"),
+                        ("Tópicos fundamentais", "Tema 1;Tema 2;Tema 3"),
+                        ("Práticas e exercícios", "Exemplo 1;Exemplo 2;Exemplo 3"),
+                        ("Avaliações e estudos de caso", "Caso 1;Caso 2"),
+                        ("Revisão e aprofundamento", "Revisão;Exercícios extra")
+                    ]
+                    for idx, (titulo, subs) in enumerate(modules, start=1):
+                        c.execute("INSERT INTO cronogramas (disciplina_id, modulo_index, titulo, subtemas, marcado, marcado_em) VALUES (?, ?, ?, ?, ?, ?)",
+                                  (did, idx, titulo, subs, 0, None))
+    conn.commit(); conn.close()
+
+# Validation helpers
+def validar_ra(ra): return bool(re.fullmatch(r"[A-Za-z0-9]{7}", ra))
+def validar_email_unip(email): return isinstance(email, str) and email.endswith("@unip.edu.br")
+def validar_senha5(senha): return senha.isdigit() and len(senha) == 5
+def calc_media(np1, np2):
+    vals = [v for v in (np1, np2) if v is not None]
+    if not vals: return None
+    return round(sum(vals)/len(vals), 2)
+def calc_freq_percent(faltas):
+    presencas = max(0, SEMESTER_TOTAL_CLASSES - faltas)
+    pct = (presencas / SEMESTER_TOTAL_CLASSES) * 100
+    return round(pct, 1)
+
+def center(win):
+    win.update_idletasks()
+    w = win.winfo_width(); h = win.winfo_height()
+    ws = win.winfo_screenwidth(); hs = win.winfo_screenheight()
+    x = (ws // 2) - (w // 2); y = (hs // 2) - (h // 2)
+    win.geometry(f"+{x}+{y}")
+
+def framed_label_entry(parent, label_text, width=40, center_label=False):
+    cont = tk.Frame(parent, bg=INNER_BG)
+    if center_label:
+        lbl = tk.Label(cont, text=label_text.upper(), font=FONT_LABEL, bg=INNER_BG)
+        lbl.pack(pady=(2,0))
+    else:
+        lbl = tk.Label(cont, text=label_text.upper(), font=FONT_LABEL, bg=INNER_BG, anchor='w')
+        lbl.pack(anchor='w')
+    box = tk.Frame(cont, bg="black", padx=1, pady=1)
+    box.pack(pady=6)
+    inner = tk.Frame(box, bg="white", padx=4, pady=4)
+    inner.pack()
+    ent = tk.Entry(inner, bd=0, width=width)
+    ent.pack()
+    return cont, ent
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        root.title("UNIP - Sistema Acadêmico")
+        root.configure(bg=MAIN_BG)
+        header = tk.Frame(root, bg=MAIN_BG); header.pack(fill='x', pady=8)
+        logo = tk.Canvas(header, width=220, height=64, bg=MAIN_BG, highlightthickness=0); logo.pack()
+        logo.create_rectangle(10,10,210,54, fill=UNIP_YELLOW, outline=UNIP_YELLOW)
+        logo.create_text(110,32, text="UNIP", font=("Arial",24,"bold"), fill="#002040")
+        tk.Label(header, text="Sistema Acadêmico Colaborativo", bg=MAIN_BG, fg=UNIP_YELLOW, font=("Arial",12)).pack()
+        tk.Label(header, text="Curso: Análise e Desenvolvimento (Noturno) - Campus Anchieta - 2º Semestre", bg=MAIN_BG, fg="#CCCCCC", font=("Arial",9)).pack()
+
+        btn_frame = tk.Frame(root, bg=MAIN_BG); btn_frame.pack(pady=12)
+        tk.Button(btn_frame, text="ALUNO", width=30, height=2, bg=BTN_BG, fg=BTN_FG, command=self.open_aluno_login).pack(pady=6)
+        tk.Button(btn_frame, text="PROFESSOR", width=30, height=2, bg=BTN_BG, fg=BTN_FG, command=self.open_prof_login).pack(pady=6)
+        tk.Button(btn_frame, text="COORDENADOR", width=30, height=2, bg=BTN_BG, fg=BTN_FG, command=self.open_coord_login).pack(pady=6)
+        tk.Label(root, text="Credenciais iniciais: alunos/profs = primeiroNome@unip.edu.br / 12345 | coord = coordenadorads@unip.edu.br / 1234567", bg=MAIN_BG, fg="#CCCCCC", font=("Arial",8)).pack(side='bottom', pady=6)
+        self.current_user = None
+
+    def open_aluno_login(self):
+        win = tk.Toplevel(self.root); win.title("Login - Aluno"); win.configure(bg=MAIN_BG)
+        card = tk.Frame(win, bg=INNER_BG, padx=20, pady=20); card.pack(padx=24, pady=24)
+        tk.Label(card, text="LOGIN - ALUNO", font=FONT_LABEL, bg=INNER_BG).pack(pady=(2,8))
+        _, e_ra = framed_label_entry(card, "RA (7 dígitos)", width=30, center_label=True); _.pack(pady=6)
+        _, e_senha = framed_label_entry(card, "SENHA (5 dígitos)", width=30, center_label=True); _.pack(pady=6)
+        btn_frame = tk.Frame(card, bg=INNER_BG); btn_frame.pack(pady=8)
+        tk.Button(btn_frame, text="Entrar", bg=BTN_BG, fg=BTN_FG, width=12, command=lambda: self.login_aluno(e_ra.get().strip(), e_senha.get().strip(), win)).pack(side='left', padx=6)
+        tk.Button(btn_frame, text="Cadastrar", bg="#4CAF50", fg='white', width=12, command=lambda: [win.destroy(), self.open_aluno_cadastro()]).pack(side='left', padx=6)
+        center(win)
+
+    def login_aluno(self, ra, senha, win):
+        if not ra or not senha:
+            messagebox.showerror("Erro", "Preencha RA e senha."); return
+        conn = connect_db(); c = conn.cursor(); c.execute("SELECT * FROM alunos WHERE ra=? AND senha=?", (ra, senha)); r = c.fetchone(); conn.close()
+        if r:
+            self.current_user = {"type":"aluno", "id": r["id"], "email": r["email"], "nome": r["nome"]}
+            win.destroy(); self.open_aluno_dashboard()
+        else:
+            messagebox.showerror("Erro", "RA ou senha inválidos.")
+
+    def open_prof_login(self):
+        win = tk.Toplevel(self.root); win.title("Login - Professor"); win.configure(bg=MAIN_BG)
+        card = tk.Frame(win, bg=INNER_BG, padx=20, pady=20); card.pack(padx=24, pady=24)
+        tk.Label(card, text="LOGIN - PROFESSOR", font=FONT_LABEL, bg=INNER_BG).pack(pady=(2,8))
+        _, e_email = framed_label_entry(card, "E-MAIL INSTITUCIONAL (@unip.edu.br)", width=40, center_label=True); _.pack(pady=6)
+        _, e_senha = framed_label_entry(card, "SENHA (5 dígitos)", width=30, center_label=True); _.pack(pady=6)
+        btn_frame = tk.Frame(card, bg=INNER_BG); btn_frame.pack(pady=8)
+        tk.Button(btn_frame, text="Entrar", bg=BTN_BG, fg=BTN_FG, width=12, command=lambda: self.login_prof(e_email.get().strip(), e_senha.get().strip(), win)).pack(side='left', padx=6)
+        tk.Button(btn_frame, text="Cadastrar", bg="#4CAF50", fg='white', width=12, command=lambda: [win.destroy(), self.open_prof_cadastro()]).pack(side='left', padx=6)
+        center(win)
+
+    def login_prof(self, email, senha, win):
+        if not email or not senha:
+            messagebox.showerror("Erro", "Preencha e-mail e senha."); return
+        conn = connect_db(); c = conn.cursor(); c.execute("SELECT * FROM professores WHERE email=? AND senha=?", (email, senha)); r = c.fetchone(); conn.close()
+        if r:
+            self.current_user = {"type":"professor", "id": r["id"], "email": r["email"], "nome": r["nome"], "disciplina": r["disciplina"]}
+            win.destroy(); self.open_prof_dashboard()
+        else:
+            messagebox.showerror("Erro", "E-mail ou senha inválidos.")
+
+    def open_coord_login(self):
+        win = tk.Toplevel(self.root); win.title("Login - Coordenador"); win.configure(bg=MAIN_BG)
+        card = tk.Frame(win, bg=INNER_BG, padx=20, pady=20); card.pack(padx=24, pady=24)
+        tk.Label(card, text="LOGIN - COORDENADOR", font=FONT_LABEL, bg=INNER_BG).pack(pady=(2,8))
+        _, e_email = framed_label_entry(card, "E-MAIL DO COORDENADOR", width=40, center_label=True); _.pack(pady=6)
+        e_email.insert(0, COORD_EMAIL)
+        _, e_senha = framed_label_entry(card, "SENHA", width=30, center_label=True); _.pack(pady=6)
+        tk.Button(card, text="Entrar", bg=BTN_BG, fg=BTN_FG, width=12, command=lambda: self.login_coord(e_email.get().strip(), e_senha.get().strip(), win)).pack(pady=8)
+        center(win)
+
+    def login_coord(self, email, senha, win):
+        if email == COORD_EMAIL and senha == COORD_PASS:
+            self.current_user = {"type":"coordenador", "email": email}
+            win.destroy(); self.open_coord_dashboard()
+        else:
+            messagebox.showerror("Erro", "Credenciais do coordenador incorretas.")
+
+    def open_aluno_cadastro(self):
+        win = tk.Toplevel(self.root); win.title("Cadastro - Aluno"); win.configure(bg=MAIN_BG)
+        card = tk.Frame(win, bg=INNER_BG, padx=18, pady=18); card.pack(padx=24, pady=24)
+        tk.Label(card, text="CADASTRO DE ALUNO", font=FONT_LABEL, bg=INNER_BG).pack(pady=(2,8))
+        form = tk.Frame(card, bg=INNER_BG); form.pack(pady=6)
+        tk.Label(form, text="NOME COMPLETO", font=FONT_LABEL, bg=INNER_BG).grid(row=0, column=0, pady=(6,2))
+        e_nome = tk.Entry(form, width=50); e_nome.grid(row=1, column=0, pady=(0,8))
+        tk.Label(form, text="DATA DE NASCIMENTO (DD/MM/AAAA)", font=FONT_LABEL, bg=INNER_BG).grid(row=2, column=0, pady=(6,2))
+        e_data = tk.Entry(form, width=20); e_data.grid(row=3, column=0, pady=(0,8))
+        tk.Label(form, text="RA (7 dígitos)", font=FONT_LABEL, bg=INNER_BG).grid(row=4, column=0, pady=(6,2))
+        e_ra = tk.Entry(form, width=20); e_ra.grid(row=5, column=0, pady=(0,8))
+        tk.Label(form, text="E-MAIL INSTITUCIONAL (@unip.edu.br)", font=FONT_LABEL, bg=INNER_BG).grid(row=6, column=0, pady=(6,2))
+        e_email = tk.Entry(form, width=50); e_email.grid(row=7, column=0, pady=(0,8))
+        tk.Label(form, text="SENHA (5 dígitos)", font=FONT_LABEL, bg=INNER_BG).grid(row=8, column=0, pady=(6,2))
+        e_senha = tk.Entry(form, width=20, show="*"); e_senha.grid(row=9, column=0, pady=(0,8))
+        def on_date_key(event):
+            s = "".join(ch for ch in e_data.get() if ch.isdigit())
+            if len(s) > 8: s = s[:8]
+            out = ""
+            if len(s) >= 2:
+                out += s[:2]
+                if len(s) >= 4:
+                    out += "/" + s[2:4]
+                    if len(s) > 4:
+                        out += "/" + s[4:8]
+                else:
+                    out += "/" + s[2:]
+            else:
+                out = s
+            e_data.delete(0, 'end'); e_data.insert(0, out)
+        e_data.bind("<KeyRelease>", on_date_key)
+        def salvar():
+            nome = e_nome.get().strip(); data = e_data.get().strip(); ra = e_ra.get().strip(); email = e_email.get().strip(); senha = e_senha.get().strip()
+            if not nome or not data or not ra or not email or not senha:
+                messagebox.showerror("Erro", "Preencha todos os campos."); return
+            if not validar_ra(ra):
+                messagebox.showerror("Erro", "RA inválido. Deve conter 7 caracteres alfanuméricos."); return
+            if not re.fullmatch(r"\d{2}/\d{2}/\d{4}", data):
+                messagebox.showerror("Erro", "Data inválida. Use DD/MM/AAAA."); return
+            if not validar_email_unip(email):
+                messagebox.showerror("Erro", "E-mail deve terminar com @unip.edu.br"); return
+            if not validar_senha5(senha):
+                messagebox.showerror("Erro", "Senha deve ter 5 dígitos numéricos."); return
+            conn = connect_db(); c = conn.cursor()
+            try:
+                c.execute("INSERT INTO alunos (nome, data_nasc, ra, senha, email) VALUES (?, ?, ?, ?, ?)", (nome, data, ra, senha, email))
+                aid = c.lastrowid
+                c.execute("INSERT OR IGNORE INTO usuarios (usuario, senha, tipo) VALUES (?, ?, ?)", (email, senha, "aluno"))
+                for dname in UNIVERSAL_DISCIPLINES:
+                    c.execute("SELECT id FROM disciplinas WHERE nome=?", (dname,)); dr = c.fetchone()
+                    if dr:
+                        did = dr["id"]
+                        c.execute("INSERT OR IGNORE INTO matriculas (aluno_id, disciplina_id) VALUES (?, ?)", (aid, did))
+                        c.execute("INSERT OR IGNORE INTO notas (aluno_id, disciplina_id, np1, np2) VALUES (?, ?, ?, ?)", (aid, did, None, None))
+                        c.execute("INSERT OR IGNORE INTO frequencia (aluno_id, disciplina_id, presencas, faltas) VALUES (?, ?, ?, ?)", (aid, did, 0, 0))
+                conn.commit(); conn.close(); db_watcher.bump(); messagebox.showinfo("Sucesso", "Aluno cadastrado e matriculado."); win.destroy()
+            except sqlite3.IntegrityError as e:
+                conn.close(); messagebox.showerror("Erro", f"RA ou e-mail já cadastrado. ({e})")
+        tk.Button(card, text="Salvar", bg="#4CAF50", fg='white', width=16, command=salvar).pack(pady=8)
+        center(win)
+
+    def open_prof_cadastro(self):
+        win = tk.Toplevel(self.root); win.title("Cadastro - Professor"); win.configure(bg=MAIN_BG)
+        card = tk.Frame(win, bg=INNER_BG, padx=18, pady=18); card.pack(padx=24, pady=24)
+        tk.Label(card, text="CADASTRO DE PROFESSOR", font=FONT_LABEL, bg=INNER_BG).pack(pady=(2,8))
+        form = tk.Frame(card, bg=INNER_BG); form.pack(pady=6)
+        tk.Label(form, text="NOME COMPLETO", font=FONT_LABEL, bg=INNER_BG).grid(row=0, column=0, pady=(6,2))
+        e_nome = tk.Entry(form, width=50); e_nome.grid(row=1, column=0, pady=(0,8))
+        tk.Label(form, text="E-MAIL INSTITUCIONAL (@unip.edu.br)", font=FONT_LABEL, bg=INNER_BG).grid(row=2, column=0, pady=(6,2))
+        e_email = tk.Entry(form, width=50); e_email.grid(row=3, column=0, pady=(0,8))
+        tk.Label(form, text="SENHA (5 dígitos)", font=FONT_LABEL, bg=INNER_BG).grid(row=4, column=0, pady=(6,2))
+        e_senha = tk.Entry(form, width=20, show="*"); e_senha.grid(row=5, column=0, pady=(0,8))
+        tk.Label(form, text="DISCIPLINA (escolha)", font=FONT_LABEL, bg=INNER_BG).grid(row=6, column=0, pady=(6,2))
+        cb = ttk.Combobox(form, values=UNIVERSAL_DISCIPLINES, state='readonly', width=50); cb.grid(row=7, column=0, pady=(0,8))
+        if UNIVERSAL_DISCIPLINES: cb.current(0)
+        def salvar():
+            nome = e_nome.get().strip(); email = e_email.get().strip(); senha = e_senha.get().strip(); disc = cb.get().strip()
+            if not nome or not email or not senha or not disc:
+                messagebox.showerror("Erro", "Preencha todos os campos."); return
+            if not validar_email_unip(email):
+                messagebox.showerror("Erro", "E-mail deve terminar com @unip.edu.br"); return
+            if not validar_senha5(senha):
+                messagebox.showerror("Erro", "Senha deve ter 5 dígitos numéricos."); return
+            conn = connect_db(); c = conn.cursor()
+            try:
+                c.execute("INSERT INTO professores (nome, email, senha, disciplina) VALUES (?, ?, ?, ?)", (nome, email, senha, disc))
+                c.execute("INSERT OR IGNORE INTO usuarios (usuario, senha, tipo) VALUES (?, ?, ?)", (email, senha, "professor"))
+                conn.commit(); conn.close(); db_watcher.bump(); messagebox.showinfo("Sucesso", "Professor cadastrado."); win.destroy()
+            except sqlite3.IntegrityError as e:
+                conn.close(); messagebox.showerror("Erro", f"E-mail já cadastrado. ({e})")
+        tk.Button(card, text="Salvar", bg="#4CAF50", fg='white', width=16, command=salvar).pack(pady=8)
+        center(win)
+
+    def open_aluno_dashboard(self):
+        if not self.current_user or self.current_user.get("type") != "aluno":
+            messagebox.showerror("Erro", "Aluno não autenticado."); return
+        aid = self.current_user["id"]
+        conn = connect_db(); c = conn.cursor(); c.execute("SELECT * FROM alunos WHERE id=?", (aid,)); aluno = c.fetchone(); conn.close()
+        if not aluno: messagebox.showerror("Erro", "Aluno não encontrado."); return
+        win = tk.Toplevel(self.root); win.title(f"Aluno - {aluno['nome']}"); win.geometry("1100x700"); win.configure(bg=MAIN_BG)
+        header = tk.Frame(win, bg=MAIN_BG); header.pack(fill='x')
+        tk.Label(header, text=f"Bem-vindo(a), {aluno['nome']}", bg=MAIN_BG, fg=UNIP_YELLOW, font=("Arial",16,"bold")).pack(pady=8)
+        content = tk.Frame(win, bg=INNER_BG); content.pack(expand=True, fill='both', padx=12, pady=12)
+        left = tk.Frame(content, bg=INNER_BG, width=340); left.pack(side='left', fill='y', padx=(6,12))
+        right = tk.Frame(content, bg=INNER_BG); right.pack(side='left', expand=True, fill='both')
+        canv = tk.Canvas(left, bg=INNER_BG, width=320, highlightthickness=0); canv.pack(pady=6, padx=6)
+        colors = ["#B8860B", "#DAA520", "#FFD54F", "#FFB74D"]
+        rect_ids = []
+        # Only show the four universal disciplines
+        for i, d in enumerate(UNIVERSAL_DISCIPLINES):
+            y1 = 12 + i*100; y2 = y1+80
+            rect = canv.create_rectangle(10, y1, 310, y2, fill=colors[i%len(colors)], outline=colors[i%len(colors)], width=2)
+            text = canv.create_text(160, (y1+y2)//2, text=d, font=("Arial",10,"bold"), width=260)
+            rect_ids.append((rect, text, d))
+        def on_canvas_click(event):
+            x,y = event.x, event.y
+            for rect, text, dname in rect_ids:
+                coords = canv.coords(rect)
+                if coords[0] <= x <= coords[2] and coords[1] <= y <= coords[3]:
+                    self._aluno_open_notas_for(aluno['id'], dname, win)
+                    break
+        canv.bind("<Button-1>", on_canvas_click)
+        nb = ttk.Notebook(right)
+        t_disc = ttk.Frame(nb); t_notas = ttk.Frame(nb); t_freq = ttk.Frame(nb); t_ia = ttk.Frame(nb)
+        nb.add(t_disc, text="Disciplinas"); nb.add(t_notas, text="Notas"); nb.add(t_freq, text="Frequência"); nb.add(t_ia, text="IA & Chat")
+        nb.pack(expand=True, fill='both')
+        # Disciplinas tab: only universal disciplines (cards)
+        frd = tk.Frame(t_disc, bg=INNER_BG); frd.pack(fill='both', expand=True, padx=12, pady=12)
+        for i, dn in enumerate(UNIVERSAL_DISCIPLINES):
+            card = tk.Frame(frd, bg="#E6C200", width=220, height=120)
+            card.grid(row=i//2, column=i%2, padx=12, pady=12)
+            tk.Label(card, text=dn, bg="#E6C200", fg="#001f3f", font=("Arial",10,"bold"), wraplength=200).place(relx=0.5, rely=0.5, anchor='center')
+            def make_click(dname=dn):
+                return lambda e=None: self._aluno_open_notas_for(aid, dname, win)
+            card.bind("<Button-1>", make_click())
+        # Notas tab (same as before)
+        tree = ttk.Treeview(t_notas, columns=("disc","np1","np2","media"), show='headings', height=14)
+        for col in ("disc","np1","np2","media"): tree.heading(col, text=col.capitalize()); tree.column(col, width=260)
+        tree.pack(fill='both', expand=True, padx=8, pady=8)
+        def load_notas():
+            for i in tree.get_children(): tree.delete(i)
+            conn = connect_db(); c = conn.cursor()
+            c.execute("""SELECT d.nome as disc, n.np1, n.np2 FROM notas n JOIN disciplinas d ON n.disciplina_id=d.id 
+                         WHERE n.aluno_id=? AND d.nome IN ({seq})""".format(seq=",".join("?"*len(UNIVERSAL_DISCIPLINES))),
+                      tuple([aid]+UNIVERSAL_DISCIPLINES))
+            rows = c.fetchall()
+            for r in rows:
+                media = calc_media(r["np1"], r["np2"])
+                iid = tree.insert('', 'end', values=(r["disc"], r["np1"] if r["np1"] is not None else "-", r["np2"] if r["np2"] is not None else "-", media if media is not None else "-"))
+                if media is not None:
+                    if media < 7: tree.item(iid, tags=('red',))
+                    else: tree.item(iid, tags=('green',))
+            tree.tag_configure('red', foreground='#B00020'); tree.tag_configure('green', foreground='#007E33')
+            conn.close()
+        load_notas()
+        # Frequencia tab
+        tf = ttk.Treeview(t_freq, columns=("disc","pres","falt","pct"), show='headings', height=14)
+        for col in ("disc","pres","falt","pct"): tf.heading(col, text=col.capitalize()); tf.column(col, width=200)
+        tf.pack(fill='both', expand=True, padx=8, pady=8)
+        def load_freq():
+            for i in tf.get_children(): tf.delete(i)
+            conn = connect_db(); c = conn.cursor()
+            c.execute("""SELECT d.nome as disc, f.presencas, f.faltas FROM frequencia f JOIN disciplinas d ON f.disciplina_id=d.id 
+                         WHERE f.aluno_id=? AND d.nome IN ({seq})""".format(seq=",".join("?"*len(UNIVERSAL_DISCIPLINES))),
+                      tuple([aid]+UNIVERSAL_DISCIPLINES))
+            for r in c.fetchall():
+                pres = r["presencas"] or 0; falt = r["faltas"] or 0
+                pct = calc_freq_percent(falt)
+                tf.insert('', 'end', values=(r["disc"], pres, falt, f"{pct}%"))
+            conn.close()
+        load_freq()
+        # IA & Chat tab similar to previous (omitted for brevity)
+        frame_ia = tk.Frame(t_ia, bg=INNER_BG); frame_ia.pack(expand=True, fill='both', padx=12, pady=12)
+        btn_ia = tk.Button(frame_ia, text="GERAR ANÁLISE IA", bg="#FF9800", fg='white', font=("Arial",12,"bold"), command=lambda: self.ia_generate(aid))
+        btn_ia.pack(pady=8)
+        chat_area = tk.Text(frame_ia, height=12, state='disabled'); chat_area.pack(fill='both', expand=True, padx=12, pady=6)
+        entry = tk.Entry(frame_ia, width=80); entry.pack(side='left', padx=8, pady=8)
+        def send_chat():
+            txt = entry.get().strip(); entry.delete(0,'end')
+            if not txt: return
+            ts = datetime.datetime.now().strftime("%d/%m/%Y %H:%M")
+            conn = connect_db(); c = conn.cursor()
+            c.execute("INSERT INTO chat (remetente_type, remetente_email, destinatario_type, destinatario_email, mensagem, data) VALUES (?, ?, ?, ?, ?, ?)",
+                      ("aluno", aluno["email"], "coordenador", COORD_EMAIL, txt, ts))
+            conn.commit(); conn.close(); db_watcher.bump()
+            chat_area.configure(state='normal'); chat_area.insert('end', f"Você ({ts}): {txt}\n"); chat_area.configure(state='disabled')
+            resp = self.ia_auto_response_for_student(aid, txt)
+            if resp:
+                now = datetime.datetime.now().strftime("%d/%m/%Y %H:%M")
+                chat_area.configure(state='normal'); chat_area.insert('end', f"IA ({now}): {resp}\n"); chat_area.configure(state='disabled')
+        tk.Button(frame_ia, text="ENVIAR", bg=BTN_BG, fg=BTN_FG, command=send_chat).pack(side='left', padx=6)
+        # poller
+        def poll():
+            token = db_watcher.value()
+            win._last_token = getattr(win, "_last_token", None)
+            if win._last_token != token:
+                load_notas(); load_freq()
+                win._last_token = token
+            win.after(1500, poll)
+        poll()
+        center(win)
+
+    def _aluno_open_notas_for(self, aluno_id, discname, parent_window):
+        # Open aluno dashboard and focus on the requested discipline tab/row if possible
+        self.open_aluno_dashboard()
+
+    def ia_generate(self, aluno_id):
+        conn = connect_db(); c = conn.cursor()
+        c.execute("""SELECT d.nome as disc, n.np1, n.np2 FROM notas n JOIN disciplinas d ON n.disciplina_id=d.id WHERE n.aluno_id=?""", (aluno_id,))
+        rows = c.fetchall(); conn.close()
+        resumo = ""
+        medias = []
+        for r in rows:
+            media = calc_media(r["np1"], r["np2"])
+            if media is not None: medias.append(media)
+            resumo += f"{r['disc']}: NP1={r['np1'] if r['np1'] is not None else '-'}, NP2={r['np2'] if r['np2'] is not None else '-'}, média={media if media is not None else '-'}\n"
+        overall = round(sum(medias)/len(medias),2) if medias else None
+        resumo_full = f"Média geral: {overall if overall is not None else '-'}\n\nDetalhes:\n{resumo}"
+        conn = connect_db(); c = conn.cursor(); c.execute("INSERT INTO ia_historico (aluno_id, data, resumo) VALUES (?, ?, ?)", (aluno_id, datetime.datetime.now().isoformat(), resumo_full)); conn.commit(); conn.close()
+        messagebox.showinfo("Análise IA", resumo_full); db_watcher.bump()
+
+    def ia_auto_response_for_student(self, aluno_id, txt):
+        t = txt.lower()
+        if "np2" in t and "quanto" in t:
+            return "Digite o nome da disciplina (exato) para eu calcular quanto precisa na NP2."
+        if "faltas" in t:
+            conn = connect_db(); c = conn.cursor(); c.execute("SELECT SUM(faltas) as totalfalt FROM frequencia WHERE aluno_id=?", (aluno_id,)); r = c.fetchone(); conn.close()
+            total = r["totalfalt"] or 0
+            remaining = max(0, MAX_ALLOWED_ABSENCES - total)
+            return f"Você ainda pode ter {remaining} faltas antes de atingir o limite de {MAX_ALLOWED_ABSENCES}."
+        for disc in UNIVERSAL_DISCIPLINES:
+            if disc.lower() in t:
+                conn = connect_db(); c = conn.cursor(); c.execute("SELECT id FROM disciplinas WHERE nome=?", (disc,)); drow = c.fetchone()
+                if not drow: conn.close(); return "Disciplina não encontrada."
+                did = drow["id"]
+                c.execute("SELECT n.np1 FROM notas n WHERE n.aluno_id=? AND n.disciplina_id=?", (aluno_id, did)); row = c.fetchone(); conn.close()
+                if not row or row["np1"] is None:
+                    return "NP1 não registrada ainda para essa disciplina."
+                np1 = row["np1"]
+                needed = round(7*2 - np1,2)
+                if needed <= 0: return f"Com NP1={np1}, você já alcançou média >=7."
+                if needed > 10: return f"Mesmo com nota máxima não chega a média 7 (valor: {needed})."
+                return f"Para média 7, com NP1={np1} você precisa NP2 >= {needed}."
+        return None
+
+    def open_prof_dashboard(self):
+        if not self.current_user or self.current_user.get("type") != "professor":
+            messagebox.showerror("Erro", "Professor não autenticado."); return
+        pid = self.current_user["id"]
+        conn = connect_db(); c = conn.cursor(); c.execute("SELECT * FROM professores WHERE id=?", (pid,)); prof = c.fetchone(); conn.close()
+        if not prof: messagebox.showerror("Erro", "Professor não encontrado."); return
+        win = tk.Toplevel(self.root); win.title(f"Professor - {prof['nome']}"); win.geometry("1100x700"); win.configure(bg=MAIN_BG)
+        tk.Label(win, text=f"Bem-vindo(a), Prof. {prof['nome']}", bg=MAIN_BG, fg=UNIP_YELLOW, font=("Arial",16,"bold")).pack(pady=8)
+        content = tk.Frame(win, bg=INNER_BG); content.pack(expand=True, fill='both', padx=12, pady=12)
+        left = tk.Frame(content, bg=INNER_BG, width=320); left.pack(side='left', fill='y', padx=(6,12))
+        right = tk.Frame(content, bg=INNER_BG); right.pack(side='left', expand=True, fill='both')
+        tk.Label(left, text=f"Disciplina: {prof['disciplina']}", bg=INNER_BG, font=("Arial",12,"bold")).pack(pady=6)
+        # tree with name and email columns
+        tree = ttk.Treeview(left, columns=("nome","email"), show='headings', height=18)
+        tree.heading("nome", text="Nome"); tree.heading("email", text="E-mail"); tree.pack(fill='both', expand=True, padx=6, pady=6)
+        # populate student list with NOME and EMAIL for discipline
+        conn = connect_db(); c = conn.cursor()
+        c.execute("SELECT id FROM disciplinas WHERE nome=?", (prof["disciplina"],)); drow = c.fetchone()
+        if drow:
+            did = drow["id"]
+            c.execute("SELECT a.nome, a.email FROM alunos a JOIN matriculas m ON a.id=m.aluno_id WHERE m.disciplina_id=?", (did,))
+            for r in c.fetchall(): tree.insert('', 'end', values=(r["nome"], r["email"]))
+        conn.close()
+        # notebook on right
+        nb = ttk.Notebook(right)
+        t_alunos = ttk.Frame(nb); t_notas = ttk.Frame(nb); t_faltas = ttk.Frame(nb); t_crono = ttk.Frame(nb)
+        nb.add(t_alunos, text="Alunos"); nb.add(t_notas, text="Lançar Notas"); nb.add(t_faltas, text="Faltas"); nb.add(t_crono, text="Cronograma")
+        nb.pack(expand=True, fill='both')
+        # Alunos table in t_alunos (re-use treeview)
+        treea = ttk.Treeview(t_alunos, columns=("nome","email"), show='headings', height=18)
+        treea.heading("nome", text="Nome"); treea.heading("email", text="E-mail"); treea.pack(fill='both', expand=True, padx=8, pady=8)
+        conn = connect_db(); c = conn.cursor()
+        if drow:
+            c.execute("SELECT a.nome, a.email FROM alunos a JOIN matriculas m ON a.id=m.aluno_id WHERE m.disciplina_id=?", (did,))
+            for r in c.fetchall(): treea.insert('', 'end', values=(r["nome"], r["email"]))
+        conn.close()
+        # Notas tab - table
+        tv = ttk.Treeview(t_notas, columns=("nome","email","np1","np2","media"), show='headings', height=14)
+        for col in ("nome","email","np1","np2","media"): tv.heading(col, text=col.capitalize()); tv.column(col, width=200)
+        tv.pack(fill='both', expand=True, padx=8, pady=8)
+        def load_prof_notas():
+            for i in tv.get_children(): tv.delete(i)
+            conn = connect_db(); c = conn.cursor()
+            c.execute("SELECT id FROM disciplinas WHERE nome=?", (prof["disciplina"],)); dr = c.fetchone()
+            if not dr: conn.close(); return
+            did = dr["id"]
+            c.execute("""SELECT a.nome as nome, a.email as email, n.np1, n.np2 FROM alunos a 
+                         JOIN notas n ON a.id=n.aluno_id WHERE n.disciplina_id=?""", (did,))
+            for r in c.fetchall():
+                media = calc_media(r["np1"], r["np2"])
+                tv.insert('', 'end', values=(r["nome"], r["email"], r["np1"] if r["np1"] is not None else "-", r["np2"] if r["np2"] is not None else "-", media if media is not None else "-"))
+            conn.close()
+        load_prof_notas()
+        # Faltas tab
+        tf = ttk.Treeview(t_faltas, columns=("nome","email","pres","falt","freq"), show='headings', height=14)
+        for col in ("nome","email","pres","falt","freq"): tf.heading(col, text=col.capitalize()); tf.column(col, width=160)
+        tf.pack(fill='both', expand=True, padx=8, pady=8)
+        def load_prof_faltas():
+            for i in tf.get_children(): tf.delete(i)
+            conn = connect_db(); c = conn.cursor(); c.execute("SELECT id FROM disciplinas WHERE nome=?", (prof["disciplina"],)); dr = c.fetchone()
+            if not dr: conn.close(); return
+            did = dr["id"]
+            c.execute("""SELECT a.nome as nome, a.email as email, f.presencas, f.faltas FROM frequencia f 
+                         JOIN alunos a ON f.aluno_id=a.id WHERE f.disciplina_id=?""", (did,))
+            for r in c.fetchall():
+                pct = calc_freq_percent(r["faltas"] or 0)
+                tf.insert('', 'end', values=(r["nome"], r["email"], r["presencas"] or 0, r["faltas"] or 0, f"{pct}%"))
+            conn.close()
+        load_prof_faltas()
+        # Bind double click to present options and switch tabs
+        def on_student_double(event):
+            sel = treea.selection()
+            if not sel: return
+            vals = treea.item(sel[0])["values"]
+            aluno_email = vals[1]; aluno_nome = vals[0]
+            # present choice dialog with only two options
+            choice = simpledialog.askstring("Ação", "Escolha: lançar notas / lançar faltas", parent=win)
+            if not choice: return
+            choice = choice.strip().lower()
+            if choice in ("lançar notas", "lancar notas", "notas", "nota"):
+                # switch to notas tab and preselect student in tv
+                nb.select(1)  # index 1 is Lançar Notas
+                load_prof_notas()
+                # find row with this email in tv and select it
+                for iid in tv.get_children():
+                    if tv.item(iid)["values"][1] == aluno_email:
+                        tv.selection_set(iid); tv.see(iid); break
+            elif choice in ("lançar faltas", "lancar faltas", "faltas"):
+                nb.select(2)  # index 2 is Faltas
+                load_prof_faltas()
+                for iid in tf.get_children():
+                    if tf.item(iid)["values"][1] == aluno_email:
+                        tf.selection_set(iid); tf.see(iid); break
+            else:
+                messagebox.showinfo("Info", "Opção inválida. Use: 'lançar notas' ou 'lançar faltas'.")
+        treea.bind("<Double-1>", on_student_double)
+        # Cronograma tab: show modules and allow marking with date in DD/MM/YYYY
+        crf = tk.Frame(t_crono); crf.pack(fill='both', expand=True, padx=8, pady=8)
+        def load_cronograma():
+            for w in crf.winfo_children(): w.destroy()
+            conn = connect_db(); c = conn.cursor(); c.execute("SELECT id FROM disciplinas WHERE nome=?", (prof["disciplina"],)); drow = c.fetchone()
+            if not drow: conn.close(); return
+            did = drow["id"]
+            c.execute("SELECT id, modulo_index, titulo, subtemas, marcado, marcado_em FROM cronogramas WHERE disciplina_id=? ORDER BY modulo_index", (did,))
+            for r in c.fetchall():
+                var = tk.IntVar(value=r["marcado"])
+                mid = r["id"]
+                subs = r["subtemas"] or ""
+                display = f"Modulo {r['modulo_index']}: {r['titulo']}\nSubtemas: " + ", ".join(subs.split(";")) if subs else f"Modulo {r['modulo_index']}: {r['titulo']}"
+                def make_toggle(row_id=mid, varref=var):
+                    def toggle():
+                        val = varref.get()
+                        # store date in DD/MM/YYYY
+                        ts = datetime.datetime.now().strftime("%d/%m/%Y") if val else None
+                        conn2 = connect_db(); c2 = conn2.cursor(); c2.execute("UPDATE cronogramas SET marcado=?, marcado_em=? WHERE id=?", (val, ts, row_id)); conn2.commit(); conn2.close(); db_watcher.bump(); load_cronograma()
+                    return toggle
+                cb = tk.Checkbutton(crf, text=display, variable=var, command=make_toggle(), anchor='w', justify='left')
+                if r["marcado"]:
+                    cb.configure(fg="#007E33")
+                    # show date when marked
+                    if r["marcado_em"]:
+                        cb_text = cb.cget("text") + f"  (marcado em: {r['marcado_em']})"
+                        cb.config(text=cb_text)
+                cb.pack(anchor='w', pady=6)
+            conn.close()
+        load_cronograma()
+        # poller
+        def poll():
+            token = db_watcher.value()
+            win._last_token = getattr(win, "_last_token", None)
+            if win._last_token != token:
+                load_prof_notas(); load_prof_faltas(); load_cronograma()
+                win._last_token = token
+            win.after(1500, poll)
+        poll()
+        center(win)
+
+    def _prof_lancar_notas(self, prof, aluno_email):
+        # not used in new flow (we direct from tabs), but keep for compatibility
+        popup = tk.Toplevel(self.root); popup.title("Lançar notas"); popup.configure(bg=INNER_BG)
+        tk.Label(popup, text=f"Aluno: {aluno_email}", bg=INNER_BG).pack(pady=6)
+        tk.Label(popup, text="NP1:").pack(); e1 = tk.Entry(popup); e1.pack()
+        tk.Label(popup, text="NP2:").pack(); e2 = tk.Entry(popup); e2.pack()
+        def salvar():
+            try:
+                np1 = float(e1.get()); np2 = float(e2.get())
+            except:
+                messagebox.showerror("Erro","Digite números válidos."); return
+            conn = connect_db(); c = conn.cursor()
+            c.execute("SELECT id FROM alunos WHERE email=?", (aluno_email,)); ar = c.fetchone()
+            c.execute("SELECT id FROM disciplinas WHERE nome=?", (prof["disciplina"],)); dr = c.fetchone()
+            if not ar or not dr: conn.close(); messagebox.showerror("Erro","Aluno ou disciplina não encontrados."); return
+            aid, did = ar["id"], dr["id"]
+            try:
+                c.execute("INSERT INTO notas (aluno_id, disciplina_id, np1, np2) VALUES (?, ?, ?, ?)", (aid, did, np1, np2))
+            except sqlite3.IntegrityError:
+                c.execute("UPDATE notas SET np1=?, np2=? WHERE aluno_id=? AND disciplina_id=?", (np1, np2, aid, did))
+            conn.commit(); conn.close(); db_watcher.bump(); messagebox.showinfo("Sucesso","Notas lançadas."); popup.destroy()
+        tk.Button(popup, text="Salvar", bg="#4CAF50", fg='white', command=salvar).pack(pady=8)
+
+    def _prof_lancar_faltas(self, prof, aluno_email):
+        popup = tk.Toplevel(self.root); popup.title("Lançar faltas"); popup.configure(bg=INNER_BG)
+        tk.Label(popup, text=f"Aluno: {aluno_email}", bg=INNER_BG).pack(pady=6)
+        tk.Label(popup, text="Faltas:").pack(); e = tk.Entry(popup); e.pack()
+        def salvar():
+            try:
+                falt = int(e.get())
+            except:
+                messagebox.showerror("Erro","Digite número válido."); return
+            conn = connect_db(); c = conn.cursor()
+            c.execute("SELECT id FROM alunos WHERE email=?", (aluno_email,)); ar = c.fetchone()
+            c.execute("SELECT id FROM disciplinas WHERE nome=?", (prof["disciplina"],)); dr = c.fetchone()
+            if not ar or not dr: conn.close(); messagebox.showerror("Erro","Erro interno."); return
+            aid, did = ar["id"], dr["id"]
+            c.execute("UPDATE frequencia SET faltas=? WHERE aluno_id=? AND disciplina_id=?", (falt, aid, did))
+            conn.commit(); conn.close(); db_watcher.bump(); messagebox.showinfo("Sucesso","Faltas atualizadas."); popup.destroy()
+        tk.Button(popup, text="Salvar", bg="#2196F3", fg='white', command=salvar).pack(pady=8)
+
+    def _prof_add_ocorrencia(self, prof, aluno_email):
+        popup = tk.Toplevel(self.root); popup.title("Adicionar ocorrência"); popup.configure(bg=INNER_BG)
+        tk.Label(popup, text=f"Aluno: {aluno_email}", bg=INNER_BG).pack(pady=6)
+        tk.Label(popup, text="Tipo:").pack(); e_tipo = tk.Entry(popup); e_tipo.pack()
+        tk.Label(popup, text="Descrição:").pack(); e_desc = tk.Entry(popup, width=60); e_desc.pack()
+        def salvar():
+            tipo = e_tipo.get().strip(); desc = e_desc.get().strip()
+            if not tipo or not desc: messagebox.showerror("Erro","Preencha tudo."); return
+            conn = connect_db(); c = conn.cursor(); c.execute("SELECT id FROM alunos WHERE email=?", (aluno_email,)); ar = c.fetchone()
+            if not ar: conn.close(); messagebox.showerror("Erro","Aluno não encontrado."); return
+            aid = ar["id"]; ts = datetime.datetime.now().isoformat()
+            c.execute("INSERT INTO ocorrencias (aluno_id, tipo, descricao, data) VALUES (?, ?, ?, ?)", (aid, tipo, desc, ts))
+            conn.commit(); conn.close(); db_watcher.bump(); messagebox.showinfo("Sucesso","Ocorrência adicionada."); popup.destroy()
+        tk.Button(popup, text="Salvar", bg="#4CAF50", fg='white', command=salvar).pack(pady=8)
+
+    def open_coord_dashboard(self):
+        if not self.current_user or self.current_user.get("type") != "coordenador":
+            messagebox.showerror("Erro", "Coordenador não autenticado."); return
+        win = tk.Toplevel(self.root); win.title("Coordenador - Painel"); win.geometry("1200x750"); win.configure(bg=MAIN_BG)
+        tk.Label(win, text="PAINEL DO COORDENADOR", bg=MAIN_BG, fg=UNIP_YELLOW, font=("Arial",16,"bold")).pack(pady=8)
+        content = tk.Frame(win, bg=INNER_BG); content.pack(expand=True, fill='both', padx=12, pady=12)
+        nb = ttk.Notebook(content)
+        t_prof = ttk.Frame(nb); t_disc = ttk.Frame(nb); t_alunos = ttk.Frame(nb); t_ia = ttk.Frame(nb)
+        nb.add(t_prof, text="Professores"); nb.add(t_disc, text="Disciplinas"); nb.add(t_alunos, text="Alunos"); nb.add(t_ia, text="IA / Histórico")
+        nb.pack(expand=True, fill='both')
+        treep = ttk.Treeview(t_prof, columns=("nome","email","disciplina"), show='headings', height=16)
+        for col in ("nome","email","disciplina"): treep.heading(col, text=col.capitalize()); treep.column(col, width=300)
+        treep.pack(fill='both', expand=True, padx=8, pady=8)
+        conn = connect_db(); c = conn.cursor(); c.execute("SELECT nome, email, disciplina FROM professores"); rows = c.fetchall(); conn.close()
+        for r in rows: treep.insert('', 'end', values=(r["nome"], r["email"], r["disciplina"]))
+        # disciplines
+        lb = tk.Listbox(t_disc, width=90, height=12); lb.pack(padx=8, pady=8)
+        conn = connect_db(); c = conn.cursor(); c.execute("SELECT id, nome FROM disciplinas"); rows = c.fetchall(); conn.close()
+        for r in rows: lb.insert('end', f"{r['id']} - {r['nome']}")
+        frd = tk.Frame(t_disc); frd.pack(pady=6)
+        tk.Label(frd, text="Nome disciplina:", bg=INNER_BG).grid(row=0,column=0); e_discname = tk.Entry(frd, width=60); e_discname.grid(row=0,column=1,padx=6)
+        def criar_disc():
+            nome = e_discname.get().strip()
+            if not nome: messagebox.showerror("Erro","Digite o nome."); return
+            conn = connect_db(); c = conn.cursor()
+            try:
+                c.execute("INSERT INTO disciplinas (nome) VALUES (?)", (nome,)); nid = c.lastrowid
+                # matriculate all existing students into new discipline
+                c.execute("SELECT id FROM alunos"); alunos = c.fetchall()
+                for a in alunos:
+                    aluno_id = a["id"]
+                    c.execute("INSERT OR IGNORE INTO matriculas (aluno_id, disciplina_id) VALUES (?, ?)", (aluno_id, nid))
+                    c.execute("INSERT OR IGNORE INTO notas (aluno_id, disciplina_id, np1, np2) VALUES (?, ?, ?, ?)", (aluno_id, nid, None, None))
+                    c.execute("INSERT OR IGNORE INTO frequencia (aluno_id, disciplina_id, presencas, faltas) VALUES (?, ?, ?, ?)", (aluno_id, nid, 0, 0))
+                conn.commit(); conn.close(); db_watcher.bump(); lb.insert('end', f"{nid} - {nome}"); messagebox.showinfo("Sucesso","Disciplina criada.")
+            except sqlite3.IntegrityError:
+                conn.close(); messagebox.showerror("Erro","Disciplina já existe.")
+        tk.Button(frd, text="Criar Disciplina", bg="#4CAF50", fg='white', command=criar_disc).grid(row=1,column=0,pady=6)
+        # students list and deletion
+        treea = ttk.Treeview(t_alunos, columns=("nome","ra","email"), show='headings', height=16)
+        for col in ("nome","ra","email"): treea.heading(col, text=col.capitalize()); treea.column(col, width=300)
+        treea.pack(fill='both', expand=True, padx=8, pady=8)
+        conn = connect_db(); c = conn.cursor(); c.execute("SELECT nome, ra, email FROM alunos"); rows = c.fetchall(); conn.close()
+        for r in rows: treea.insert('', 'end', values=(r["nome"], r["ra"], r["email"]))
+        fr = tk.Frame(t_alunos); fr.pack(pady=6)
+        conn = connect_db(); c = conn.cursor(); c.execute("SELECT descricao FROM motivos_exclusao"); motivos = [r["descricao"] for r in c.fetchall()]; conn.close()
+        motivos_cb = ttk.Combobox(fr, values=motivos, width=60); motivos_cb.grid(row=0,column=1,padx=6)
+        tk.Label(fr, text="Motivo de exclusão:", bg=INNER_BG).grid(row=0,column=0); tk.Label(fr, text="Senha Coordenador:", bg=INNER_BG).grid(row=1,column=0)
+        e_coord_pass = tk.Entry(fr, show="*"); e_coord_pass.grid(row=1,column=1,padx=6)
+        def excluir_aluno():
+            sel = treea.selection()
+            if not sel: messagebox.showerror("Erro","Selecione um aluno."); return
+            motivo = motivos_cb.get().strip()
+            if not motivo: messagebox.showerror("Erro","Selecione motivo."); return
+            senha = e_coord_pass.get().strip()
+            if senha != COORD_PASS: messagebox.showerror("Erro","Senha incorreta."); return
+            email = treea.item(sel[0])["values"][2]
+            conn = connect_db(); c = conn.cursor(); c.execute("SELECT id FROM alunos WHERE email=?", (email,)); ar = c.fetchone()
+            if not ar: conn.close(); messagebox.showerror("Erro","Aluno não encontrado."); return
+            aid = ar["id"]
+            c.execute("DELETE FROM alunos WHERE id=?", (aid,))
+            c.execute("DELETE FROM matriculas WHERE aluno_id=?", (aid,))
+            c.execute("DELETE FROM notas WHERE aluno_id=?", (aid,))
+            c.execute("DELETE FROM frequencia WHERE aluno_id=?", (aid,))
+            conn.commit(); conn.close(); db_watcher.bump(); treea.delete(sel[0]); messagebox.showinfo("Sucesso","Aluno excluído.")
+        tk.Button(fr, text="Excluir Aluno (requere senha)", bg="#B00020", fg='white', command=excluir_aluno).grid(row=2,column=0,pady=6)
+        # IA history
+        txt = tk.Text(t_ia); txt.pack(fill='both', expand=True, padx=8, pady=8)
+        conn = connect_db(); c = conn.cursor(); c.execute("SELECT a.nome, h.data, h.resumo FROM ia_historico h JOIN alunos a ON h.aluno_id=a.id ORDER BY h.id DESC LIMIT 200"); rows = c.fetchall(); conn.close()
+        for r in rows: txt.insert('end', f"{r['data']} - {r['nome']}\n{r['resumo']}\n\n")
+        center(win)
+
+def main():
+    init_db()
+    seed_initial_data()
+    root = tk.Tk()
+    app = App(root)
+    center(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
